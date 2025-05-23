@@ -15,30 +15,38 @@
 *)
 module FStar.ST
 
+open FStar.Tactics
 open FStar.TSet
 open FStar.Heap
 open FStar.Preorder
+open FStar.MST
 
 module W = FStar.Monotonic.Witnessed
 
 (***** Global ST (GST) effect with put, get, witness, and recall *****)
 
-new_effect GST = STATE_h heap
+let heap_rel (h1:heap) (h2:heap) =
+  forall (a:Type0) (rel:preorder a) (r:mref a rel). h1 `contains` r ==>
+                                               (h2 `contains` r /\ rel (sel h1 r) (sel h2 r))
+
+let state_heap : tstate = { t = heap; rel = heap_rel }
+
+effect GST (a:Type) (wp:st_wp_h heap a) =
+  MSTwp a state_heap wp
 
 let gst_pre           = st_pre_h heap
 let gst_post' (a:Type) (pre:Type) = st_post_h' heap a pre
 let gst_post  (a:Type) = st_post_h heap a
 let gst_wp (a:Type)   = st_wp_h heap a
 
-unfold let lift_div_gst (a:Type) (wp:pure_wp a) (p:gst_post a) (h:heap) = wp (fun a -> p a h)
-sub_effect DIV ~> GST = lift_div_gst
+//fold let lift_div_mst (a:Type) (wp:pure_wp a) (p:gst_post a) (h:heap) = wp (fun a -> p a h)
+//sub_effect DIV ~> MSTwp = lift_div_gst
 
-let heap_rel (h1:heap) (h2:heap) =
-  forall (a:Type0) (rel:preorder a) (r:mref a rel). h1 `contains` r ==>
-                                               (h2 `contains` r /\ rel (sel h1 r) (sel h2 r))
 
-assume val gst_get: unit    -> GST heap (fun p h0 -> p h0 h0)
-assume val gst_put: h1:heap -> GST unit (fun p h0 -> heap_rel h0 h1 /\ p () h1)
+val gst_get: unit    -> GST heap (fun p h0 -> p h0 h0)
+let gst_get = mst_get state_heap
+val gst_put: h1:heap -> GST unit (fun p h0 -> heap_rel h0 h1 /\ p () h1)
+let gst_put = mst_put state_heap
 
 type heap_predicate = heap -> Type0
 
@@ -48,10 +56,17 @@ let stable (p:heap_predicate) =
 [@@"opaque_to_smt"]
 let witnessed (p:heap_predicate{stable p}) : Type0 = W.witnessed heap_rel p
 
-assume val gst_witness: p:heap_predicate -> GST unit (fun post h0 -> stable p /\ p h0 /\ (witnessed p ==> post () h0))
-assume val gst_recall:  p:heap_predicate -> GST unit (fun post h0 -> stable p /\ witnessed p /\ (p h0 ==> post () h0))
+val gst_witness: p:heap_predicate -> GST unit (fun post h0 -> stable p /\ p h0 /\ (witnessed p ==> post () h0))
+let gst_witness p =
+  reveal_opaque (`%witnessed) witnessed;
+  mst_witness state_heap p
 
-val lemma_functoriality (p:heap_predicate{stable p /\ witnessed p}) 
+val gst_recall:  p:heap_predicate -> GST unit (fun post h0 -> stable p /\ witnessed p /\ (p h0 ==> post () h0))
+let gst_recall p =
+  reveal_opaque (`%witnessed) witnessed;
+  mst_recall state_heap p
+
+val lemma_functoriality (p:heap_predicate{stable p /\ witnessed p})
                         (q:heap_predicate{stable q /\ (forall (h:heap). p h ==> q h)})
   :Lemma (ensures (witnessed q))
 let lemma_functoriality p q =
@@ -65,10 +80,7 @@ let st_post' = gst_post'
 let st_post  = gst_post
 let st_wp    = gst_wp
 
-new_effect STATE = GST
-
-unfold let lift_gst_state (a:Type) (wp:gst_wp a) = wp
-sub_effect GST ~> STATE = lift_gst_state
+effect STATE (a:Type) (wp:st_wp a) = GST a wp
 
 effect State (a:Type) (wp:st_wp a) = STATE a wp
 
@@ -82,6 +94,7 @@ type mref (a:Type0) (rel:preorder a) = r:Heap.mref a rel{is_mm r = false /\ witn
 
 let recall (#a:Type) (#rel:preorder a) (r:mref a rel) :STATE unit (fun p h -> Heap.contains h r ==> p () h)
   = gst_recall (contains_pred r)
+
 
 let alloc (#a:Type) (#rel:preorder a) (init:a)
   :ST (mref a rel)
