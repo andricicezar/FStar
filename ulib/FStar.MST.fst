@@ -279,11 +279,114 @@ let rec lemma_theta_is_lax_morphism_bind
 (** ** END Section 3: theta **)
 
 (** ** START Section 4: Dijkstra Monad **)
-let mst (a:Type u#a) (state:tstate u#1) (wp:st_wp_h state.t a)=
+let total_mst (a:Type u#a) (state:tstate u#1) (wp:st_wp_h state.t a)=
   m:(free state a){theta m ⊑ wp}
 
-let mst_return (a:Type u#a) (x:a) (state:tstate u#1) : mst a state (st_return state.t a x) =
+let total_mst_return (a:Type u#a) (x:a) (state:tstate u#1) : total_mst a state (st_return state.t a x) =
   free_return state a x
+
+let total_mst_bind
+  (a : Type u#a)
+  (b : Type u#b)
+  (state:tstate u#1)
+  (wp_v : st_wp_h state.t a)
+  (wp_f: a -> st_wp_h state.t b)
+  (v : total_mst a state wp_v)
+  (f : (x:a -> total_mst b state (wp_f x))) :
+  Tot (total_mst b state (st_bind_wp state.t a b wp_v wp_f)) =
+  lemma_theta_is_lax_morphism_bind v f;
+  free_bind v f
+
+let total_mst_subcomp
+  (a : Type u#a)
+  (state:tstate u#1)
+  (wp1 : st_wp_h state.t a)
+  (wp2 : st_wp_h state.t a)
+  (v : total_mst a state wp1)
+  : Pure (total_mst a state wp2) (requires (wp1 ⊑ wp2)) (ensures (fun _ -> True)) =
+  v
+
+let total_mst_if_then_else
+  (a : Type u#a)
+  (state:tstate u#1)
+  (wp1 : st_wp_h state.t a)
+  (wp2 : st_wp_h state.t a)
+  (f : total_mst a state wp1) (g : total_mst a state wp2) (b : bool) : Type =
+  total_mst a state (st_if_then_else state.t a b wp1 wp2)
+(** ** END Section 4: Dijkstra Monad **)
+
+[@@ top_level_effect; primitive_extraction]
+// reifiable -- this could be now turned on
+total
+reflectable
+effect {
+  TotalMSTwp (a:Type) ([@@@ effect_param] state:tstate u#1) (wp : st_wp_h state.t a)
+  with {
+    repr         = total_mst;
+    return       = total_mst_return ;
+    bind         = total_mst_bind ;
+    subcomp      = total_mst_subcomp ;
+    if_then_else = total_mst_if_then_else
+  }
+}
+
+unfold
+let wp_lift_pure_st (w : pure_wp 'a) (state:tstate) : st_wp_h state.t 'a =
+  FStar.Monotonic.Pure.elim_pure_wp_monotonicity_forall ();
+  fun p h -> w (fun r -> p r h)
+
+let partial_return state (pre:pure_pre) : total_mst (squash pre) state (partial_call_wp pre) =
+  PartialCall pre (Return)
+
+val lift_pure_mst :
+  a: Type u#a ->
+  state:tstate u#1 ->
+  w: pure_wp a ->
+  f: (eqtype_as_type unit -> PURE a w) ->
+  Tot (total_mst a state (wp_lift_pure_st w state))
+let lift_pure_mst a state w f =
+  FStar.Monotonic.Pure.elim_pure_wp_monotonicity_forall ();
+  let lhs = partial_return state (as_requires w) in
+  let rhs = (fun (pre:(squash (as_requires w))) -> total_mst_return a (f pre) state) in
+  let m = total_mst_bind _ _ state _ _ lhs rhs in
+  total_mst_subcomp _ state _ _ m
+
+sub_effect PURE ~> TotalMSTwp = lift_pure_mst
+
+let total_mst_get state () : TotalMSTwp state.t state get_wp =
+  TotalMSTwp?.reflect (Get Return)
+
+let total_mst_put state (h1:state.t) : TotalMSTwp unit state (put_wp h1) =
+  TotalMSTwp?.reflect (Put h1 Return)
+
+let total_mst_witness state (pred:state.t -> Type0) : TotalMSTwp unit state (witness_wp pred) =
+  TotalMSTwp?.reflect (Witness pred Return)
+
+let total_mst_recall state (pred:state.t -> Type0) : TotalMSTwp unit state (recall_wp pred) =
+  TotalMSTwp?.reflect (Recall pred Return)
+
+let mst (a:Type u#a) (state:tstate u#1) (wp:st_wp_h state.t a)=
+  unit -> Dv (total_mst a state wp)
+
+let mst_return (a:Type u#a) (x:a) (state:tstate u#1) : mst a state (st_return state.t a x) =
+  fun () -> total_mst_return a x state
+
+let rec dv_free_bind
+  (#state:tstate u#s)
+  (#a:Type u#a)
+  (#b:Type u#b)
+  (l : free state a)
+  (k : a -> Dv (free state b)) :
+  Dv (free state b) =
+  match l with
+  | Return x -> k x
+  | Get cont -> Get (fun x -> dv_free_bind (cont x) k) // <-- the bind is Dv, but a Pure lambda is expected based on the sig of Get
+  | Put h cont -> Put h (fun _ -> dv_free_bind (cont ()) k)
+  | Witness pred cont -> Witness pred (fun _ -> dv_free_bind (cont ()) k)
+  | Recall pred cont -> Recall pred (fun _ -> dv_free_bind (cont ()) k)
+  | PartialCall pre fnc ->
+      PartialCall pre (fun _ ->
+        dv_free_bind (fnc ()) k)
 
 let mst_bind
   (a : Type u#a)
@@ -294,9 +397,10 @@ let mst_bind
   (v : mst a state wp_v)
   (f : (x:a -> mst b state (wp_f x))) :
   Tot (mst b state (st_bind_wp state.t a b wp_v wp_f)) =
-  lemma_theta_is_lax_morphism_bind v f;
-  free_bind v f
+  fun () ->
+    total_mst_bind a b state wp_v wp_f (v ()) (fun x -> f x ()) // <-- f is Dv, but the lambda has to be Pure
 
+(**
 let mst_subcomp
   (a : Type u#a)
   (state:tstate u#1)
@@ -313,63 +417,4 @@ let mst_if_then_else
   (wp2 : st_wp_h state.t a)
   (f : mst a state wp1) (g : mst a state wp2) (b : bool) : Type =
   mst a state (st_if_then_else state.t a b wp1 wp2)
-(** ** END Section 4: Dijkstra Monad **)
-
-[@@ top_level_effect; primitive_extraction]
-// reifiable -- this could be now turned on
-total
-reflectable
-effect {
-  MSTwp (a:Type) ([@@@ effect_param] state:tstate u#1) (wp : st_wp_h state.t a)
-  with {
-    repr         = mst;
-    return       = mst_return ;
-    bind         = mst_bind ;
-    subcomp      = mst_subcomp ;
-    if_then_else = mst_if_then_else
-  }
-}
-
-unfold
-let wp_lift_pure_st (w : pure_wp 'a) (state:tstate) : st_wp_h state.t 'a =
-  FStar.Monotonic.Pure.elim_pure_wp_monotonicity_forall ();
-  fun p h -> w (fun r -> p r h)
-
-let partial_return state (pre:pure_pre) : mst (squash pre) state (partial_call_wp pre) =
-  PartialCall pre (Return)
-
-val lift_pure_mst :
-  a: Type u#a ->
-  state:tstate u#1 ->
-  w: pure_wp a ->
-  f: (eqtype_as_type unit -> PURE a w) ->
-  Tot (mst a state (wp_lift_pure_st w state))
-let lift_pure_mst a state w f =
-  FStar.Monotonic.Pure.elim_pure_wp_monotonicity_forall ();
-  let lhs = partial_return state (as_requires w) in
-  let rhs = (fun (pre:(squash (as_requires w))) -> mst_return a (f pre) state) in
-  let m = mst_bind _ _ state _ _ lhs rhs in
-  mst_subcomp _ state _ _ m
-
-sub_effect PURE ~> MSTwp = lift_pure_mst
-
-unfold
-let lift_div_mst
-  (a: Type u#a)
-  (state:tstate u#1)
-  (w: pure_wp a) =
-  wp_lift_pure_st w state
-
-// sub_effect DIV ~> MSTwp = lift_div_mst
-
-let mst_get state () : MSTwp state.t state get_wp =
-  MSTwp?.reflect (Get Return)
-
-let mst_put state (h1:state.t) : MSTwp unit state (put_wp h1) =
-  MSTwp?.reflect (Put h1 Return)
-
-let mst_witness state (pred:state.t -> Type0) : MSTwp unit state (witness_wp pred) =
-  MSTwp?.reflect (Witness pred Return)
-
-let mst_recall state (pred:state.t -> Type0) : MSTwp unit state (recall_wp pred) =
-  MSTwp?.reflect (Recall pred Return)
+**)
